@@ -1,0 +1,366 @@
+"""
+Training script for Sign Language Transformer (pose → English/German).
+
+Features:
+  - Joint recognition + translation training (paper equation 8)
+  - Adam optimiser with plateau LR scheduling (paper §5.1)
+  - Checkpoint saving after every improvement
+  - BLEU score evaluation on dev set
+  - Model export to .pt / TorchScript / ONNX after training
+
+Usage:
+    python train.py --config config.json
+    python train.py --dummy_data       # smoke-test with synthetic data
+"""
+
+import argparse
+import json
+import os
+import time
+import sys
+import math
+from typing import Optional
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+# Project imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+from models.sign_language_transformer import SignLanguageTransformer
+from utils.vocabulary import Vocabulary
+from utils.metrics import compute_bleu, compute_wer
+from data.dataset import (
+    build_dataloader,
+    generate_dummy_annotations,
+)
+from utils.exporter import export_model
+
+
+# ---------------------------------------------------------------------------
+# Training loop helpers
+# ---------------------------------------------------------------------------
+
+def run_epoch(
+    model: SignLanguageTransformer,
+    loader: DataLoader,
+    optimizer: Optional[torch.optim.Optimizer],
+    device: torch.device,
+    train: bool = True,
+    grad_clip: float = 1.0,
+) -> dict:
+    model.train(train)
+    total_loss = total_lr = total_lt = n_batches = 0
+
+    with torch.set_grad_enabled(train):
+        for batch in loader:
+            pose      = batch["pose"].to(device)
+            pose_lens = batch["pose_lens"].to(device)
+            gloss_ids = batch["gloss_ids"].to(device)
+            gloss_lens= batch["gloss_lens"].to(device)
+            trans_ids = batch["trans_ids"].to(device)
+            trans_lens= batch["trans_lens"].to(device)
+
+            loss, lr, lt = model(
+                pose, pose_lens,
+                trans_ids, trans_lens,
+                gloss_ids, gloss_lens,
+            )
+
+            if train:
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                optimizer.step()
+
+            total_loss += loss.item()
+            total_lr   += lr.item()
+            total_lt   += lt.item()
+            n_batches  += 1
+
+    n = max(n_batches, 1)
+    return {
+        "loss":      total_loss / n,
+        "loss_r":    total_lr / n,
+        "loss_t":    total_lt / n,
+    }
+
+
+@torch.no_grad()
+def evaluate_translations(
+    model: SignLanguageTransformer,
+    loader: DataLoader,
+    word_vocab: Vocabulary,
+    device: torch.device,
+    beam_size: int = 5,
+    max_gen_len: int = 100,
+) -> dict:
+    """Run beam-search on dev/test set and compute BLEU + WER."""
+    model.eval()
+    hypotheses = []
+    references = []
+
+    for batch in loader:
+        pose      = batch["pose"].to(device)
+        pose_lens = batch["pose_lens"].to(device)
+        trans_ids = batch["trans_ids"]          # (B, U+2) cpu
+
+        preds = model.generate(pose, pose_lens, beam_size=beam_size, max_len=max_gen_len)
+
+        for pred_ids, ref_ids in zip(preds, trans_ids.tolist()):
+            pred_toks = word_vocab.decode(pred_ids, skip_special=True)
+            ref_toks  = word_vocab.decode(ref_ids,  skip_special=True)
+            hypotheses.append(pred_toks)
+            references.append([ref_toks])  # BLEU expects list-of-references
+
+    bleu = compute_bleu(hypotheses, references)
+    return {"bleu4": bleu["bleu4"], "bleu1": bleu["bleu1"]}
+
+
+# ---------------------------------------------------------------------------
+# Main training function
+# ---------------------------------------------------------------------------
+
+def train(cfg: dict):
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() and not cfg.get("cpu", False) else "cpu"
+    )
+    print(f"[train] device = {device}")
+
+    # ── Vocabularies ──────────────────────────────────────────────────────
+    if cfg.get("dummy_data"):
+        print("[train] Generating dummy data for smoke-testing …")
+        train_anns, all_g, all_w = generate_dummy_annotations(
+            n_samples=cfg.get("dummy_n", 200),
+            pose_dir=cfg.get("pose_dir", "/tmp/pose2text_dummy"),
+            pose_dim=cfg.get("pose_dim", 1629),
+        )
+        dev_anns = train_anns[:20]  # reuse subset for dev in smoke-test
+
+        gloss_vocab = Vocabulary()
+        gloss_vocab.build_from_list(all_g)
+        word_vocab = Vocabulary()
+        word_vocab.build_from_list(all_w)
+    else:
+        # Load from disk
+        # use_gloss = cfg.get("use_gloss", True)
+
+        use_gloss = cfg.get("use_gloss", True)
+        gloss_vocab = Vocabulary.load(cfg["gloss_vocab_path"]) if use_gloss and cfg.get("gloss_vocab_path") else None
+    # gloss_vocab = Vocabulary.load(cfg["gloss_vocab_path"]) if use_gloss and cfg.get("gloss_vocab_path") else None
+        word_vocab  = Vocabulary.load(cfg["word_vocab_path"])
+        with open(cfg["train_annotations"]) as f:
+            train_anns = json.load(f)
+        with open(cfg["dev_annotations"]) as f:
+            dev_anns = json.load(f)
+
+    print(f"[vocab] gloss size={len(gloss_vocab)}  word size={len(word_vocab)}")
+
+    # ── DataLoaders ───────────────────────────────────────────────────────
+    batch_size  = cfg.get("batch_size", 32)
+    num_workers = cfg.get("num_workers", 0)
+
+    train_loader = build_dataloader(
+        train_anns, gloss_vocab, word_vocab,
+        batch_size=batch_size, shuffle=True, num_workers=num_workers,
+        normalise=cfg.get("normalise", "z-score"),
+    )
+    dev_loader = build_dataloader(
+        dev_anns, gloss_vocab, word_vocab,
+        batch_size=batch_size, shuffle=False, num_workers=num_workers,
+        normalise=cfg.get("normalise", "z-score"),
+    )
+
+    # ── Model ─────────────────────────────────────────────────────────────
+    pose_dim = cfg.get("pose_dim", 1629)
+    model = SignLanguageTransformer(
+        pose_input_dim=pose_dim,
+        gloss_vocab_size=len(gloss_vocab),
+        word_vocab_size=len(word_vocab),
+        d_model=cfg.get("d_model", 512),
+        nhead=cfg.get("nhead", 8),
+        num_encoder_layers=cfg.get("num_encoder_layers", 3),
+        num_decoder_layers=cfg.get("num_decoder_layers", 3),
+        dim_feedforward=cfg.get("dim_feedforward", 2048),
+        dropout=cfg.get("dropout", 0.1),
+        pad_idx=word_vocab.pad_idx,
+        bos_idx=word_vocab.bos_idx,
+        eos_idx=word_vocab.eos_idx,
+        blank_idx=gloss_vocab.pad_idx,
+        lambda_recognition=cfg.get("lambda_recognition", 5.0),
+        lambda_translation=cfg.get("lambda_translation", 1.0),
+    ).to(device)
+
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[model] parameters = {n_params:,}")
+
+    # ── Optimiser + LR scheduler ──────────────────────────────────────────
+    lr        = cfg.get("lr", 1e-3)
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=lr,
+        betas=(cfg.get("beta1", 0.9), cfg.get("beta2", 0.998)),
+        weight_decay=cfg.get("weight_decay", 1e-3),
+    )
+    # Plateau scheduler as described in paper §5.1:
+    # reduce by 0.7 if dev loss doesn't improve for 8 evaluations
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=cfg.get("lr_decay", 0.7),
+        patience=cfg.get("patience", 8),
+        min_lr=1e-6,
+        verbose=True,
+    )
+
+    # ── Checkpoint directory ──────────────────────────────────────────────
+    ckpt_dir = cfg.get("checkpoint_dir", "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    best_dev_loss = math.inf
+    best_epoch    = 0
+    patience_counter = 0
+    max_epochs    = cfg.get("max_epochs", 100)
+    eval_every    = cfg.get("eval_every", 1)      # epochs between full BLEU eval
+
+    history = []
+
+    print(f"\n{'Epoch':>6}  {'Train Loss':>12}  {'Dev Loss':>10}  {'BLEU-4':>8}  {'LR':>10}")
+    print("-" * 55)
+
+    for epoch in range(1, max_epochs + 1):
+        t0 = time.time()
+
+        # ── Train ─────────────────────────────────────────────────────────
+        train_metrics = run_epoch(model, train_loader, optimizer, device, train=True)
+
+        # ── Dev loss ──────────────────────────────────────────────────────
+        dev_metrics = run_epoch(model, dev_loader, None, device, train=False)
+        dev_loss = dev_metrics["loss"]
+
+        # ── BLEU (every eval_every epochs) ────────────────────────────────
+        bleu4 = 0.0
+        if epoch % eval_every == 0:
+            trans_metrics = evaluate_translations(
+                model, dev_loader, word_vocab, device,
+                beam_size=cfg.get("beam_size", 5),
+            )
+            bleu4 = trans_metrics["bleu4"]
+
+        scheduler.step(dev_loss)
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        dt = time.time() - t0
+        print(
+            f"{epoch:>6}  {train_metrics['loss']:>12.4f}  {dev_loss:>10.4f}"
+            f"  {bleu4:>8.2f}  {current_lr:>10.2e}  ({dt:.1f}s)"
+        )
+
+        row = {
+            "epoch": epoch,
+            "train_loss": train_metrics["loss"],
+            "train_loss_r": train_metrics["loss_r"],
+            "train_loss_t": train_metrics["loss_t"],
+            "dev_loss": dev_loss,
+            "bleu4": bleu4,
+            "lr": current_lr,
+        }
+        history.append(row)
+
+        # ── Save best checkpoint ───────────────────────────────────────────
+        if dev_loss < best_dev_loss:
+            best_dev_loss = dev_loss
+            best_epoch    = epoch
+            patience_counter = 0
+            _save_checkpoint(model, optimizer, scheduler, epoch, row, cfg, ckpt_dir, word_vocab, gloss_vocab, tag="best")
+            print(f"          ↑ new best (dev_loss={dev_loss:.4f})")
+        else:
+            patience_counter += 1
+
+        # ── Periodic checkpoint ────────────────────────────────────────────
+        if epoch % cfg.get("save_every", 5) == 0:
+            _save_checkpoint(model, optimizer, scheduler, epoch, row, cfg, ckpt_dir, word_vocab, gloss_vocab, tag=f"epoch{epoch:04d}")
+
+        # ── Early stopping ────────────────────────────────────────────────
+        early_stop = cfg.get("early_stop_patience", 20)
+        if patience_counter >= early_stop:
+            print(f"\n[train] Early stopping at epoch {epoch} (no improvement for {early_stop} epochs)")
+            break
+
+        if current_lr <= 1e-6:
+            print(f"\n[train] Learning rate reached minimum — stopping.")
+            break
+
+    # ── Save training history ─────────────────────────────────────────────
+    hist_path = os.path.join(ckpt_dir, "history.json")
+    with open(hist_path, "w") as f:
+        json.dump(history, f, indent=2)
+    print(f"\n[train] History saved → {hist_path}")
+    print(f"[train] Best epoch: {best_epoch}  dev_loss={best_dev_loss:.4f}")
+
+    # ── Export best model ─────────────────────────────────────────────────
+    best_ckpt = os.path.join(ckpt_dir, "checkpoint_best.pt")
+    export_dir = cfg.get("export_dir", "exports")
+    if os.path.exists(best_ckpt):
+        print(f"\n[train] Exporting best model …")
+        state = torch.load(best_ckpt, map_location=device)
+        model.load_state_dict(state["model_state_dict"])
+        export_model(model, word_vocab, gloss_vocab, cfg, export_dir, device)
+
+    return history
+
+
+def _save_checkpoint(model, optimizer, scheduler, epoch, metrics, cfg, ckpt_dir, word_vocab, gloss_vocab, tag="latest"):
+    path = os.path.join(ckpt_dir, f"checkpoint_{tag}.pt")
+    torch.save({
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "metrics": metrics,
+        "model_config": model.get_config(),
+        "cfg": cfg,
+    }, path)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Train Sign Language Transformer")
+    p.add_argument("--config", type=str, default=None, help="Path to JSON config file")
+    p.add_argument("--dummy_data", action="store_true", help="Use synthetic data for smoke-testing")
+    p.add_argument("--dummy_n", type=int, default=200, help="Number of dummy samples")
+    p.add_argument("--pose_dim", type=int, default=1629, help="Pose input dimension")
+    p.add_argument("--d_model", type=int, default=512)
+    p.add_argument("--nhead", type=int, default=8)
+    p.add_argument("--num_encoder_layers", type=int, default=3)
+    p.add_argument("--num_decoder_layers", type=int, default=3)
+    p.add_argument("--batch_size", type=int, default=4)
+    p.add_argument("--max_epochs", type=int, default=5)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lambda_recognition", type=float, default=5.0)
+    p.add_argument("--lambda_translation", type=float, default=1.0)
+    p.add_argument("--checkpoint_dir", type=str, default="checkpoints")
+    p.add_argument("--export_dir", type=str, default="exports")
+    p.add_argument("--cpu", action="store_true")
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    if args.config:
+        with open(args.config) as f:
+            cfg = json.load(f)
+    else:
+        cfg = vars(args)
+
+    # Override with CLI flags
+    if args.dummy_data:
+        cfg["dummy_data"] = True
+    if args.dummy_n:
+        cfg["dummy_n"] = args.dummy_n
+
+    train(cfg)

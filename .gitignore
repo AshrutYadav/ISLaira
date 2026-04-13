@@ -2,3 +2,7 @@ isign/
 ISLtranslate/
 tensorflow-2.8.0-cp39-cp39-linux_x86_64.whl
 venv/
+data/isign_poses/
+checkpoints/checkpoint_epoch0045.pt
+checkpoints/checkpoint_best.pt
+scripts/train (Copy).py

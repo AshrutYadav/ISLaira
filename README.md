@@ -32,8 +32,31 @@ python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 python -m ipykernel install --user --name vocalbridge_env --display-name "VocalBridge (Python 3.9)"
-3. Kaggle Training Workflow
-Main model training is conducted on Kaggle to utilize modern GPU accelerators.
+
+3. How to use 
+After activating the local venv 
+Download checkpoints_best.pt from "https://drive.google.com/drive/folders/1u_HneS71wE9mFFRDKu0hVWqpX6ZvCPQh?usp=sharing"
+Push the checkpoints_best.pt to ./checkpoints/
+Then use this command to get the output of the model on any pose availabel in the datset
+
+bash
+python scripts/predict.py     --checkpoint checkpoints/checkpoint_best.pt     --vocab      data/word_vocab.json     --pose       data/isign_poses/<Name of the pose file>
+
+Use this command if you want to train the model again (best output arives on epoch 40)
+before that create a data/isign_poses with the extracted isign poses 
+
+bash
+python scripts/convert_isign.py     --csv   data/iSign_v1.1.csv     --poses data/isign_poses/     --out   data/
+python scripts/train.py --config config_isign.json
+
+If in any case the training fails use these command to resume the training 
+
+bash
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+python scripts/train.py --config config_isign.json --resume
+
+4. Training Workflow
+Main model training is conducted on local collage hardware to utilize modern GPU accelerators.
 
 Data Access: Data is split into four parts (part_aa through part_ad) to bypass disk limits.
 
@@ -77,3 +100,4 @@ Code snippet
     year = "2023"
 }
 The iSign and ISLTranslate datasets are released under the CC BY-NC-SA 4.0 license and are intended for research purposes only.
+
