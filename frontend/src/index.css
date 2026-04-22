@@ -1,0 +1,43 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap');
+
+@import "tailwindcss";
+
+@theme {
+  --color-dark-900: #0B0F19;
+  --color-dark-800: #141B2D;
+  --color-dark-700: #1E293B;
+  --color-primary-500: #0ea5e9;
+  --color-primary-400: #38bdf8;
+  --color-accent-500: #10B981;
+  --color-accent-400: #34D399;
+  --font-sans: "Inter", sans-serif;
+  --font-display: "Outfit", sans-serif;
+  --animate-pulse-slow: pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@layer base {
+  body {
+    @apply bg-dark-900 text-gray-100 font-sans antialiased;
+  }
+  h1, h2, h3, h4, h5, h6 {
+    @apply font-display tracking-tight;
+  }
+}
+
+@layer utilities {
+  .glass-panel {
+    @apply bg-dark-800/80 backdrop-blur-md border border-gray-700/50 shadow-xl rounded-2xl;
+  }
+  
+  .btn-primary {
+    @apply bg-primary-500 hover:bg-primary-400 text-white font-medium py-2 px-4 rounded-xl transition-all duration-200 active:scale-95;
+  }
+  
+  .btn-secondary {
+    @apply bg-dark-700 hover:bg-gray-600 text-white font-medium py-2 px-4 rounded-xl transition-all duration-200 active:scale-95;
+  }
+
+  .btn-icon {
+    @apply p-2 rounded-xl hover:bg-gray-700/50 transition-colors duration-200 text-gray-400 hover:text-white flex items-center justify-center;
+  }
+}
